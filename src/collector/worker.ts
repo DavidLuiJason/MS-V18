@@ -17,6 +17,9 @@ let secondsEnabled = false;
 let secondsRetentionHours = 72;
 let secondsTimer: any = null;
 let secondsCleanTimer: any = null;
+let secondsHealTimer: any = null;
+let isHealingSeconds = false;
+const secondsHealCursors = new Map<string, number>();
 const secondBatch = new Map<string, SecondCandleRecord>();
 
 let secLabEnabled = false;
@@ -603,6 +606,15 @@ async function applySecondsSetting() {
     if (enabled !== secondsEnabled) {
       secondsEnabled = enabled;
       adapter.setSecondsEnabled?.(enabled);
+      if (!enabled) {
+        if (secondsHealTimer) {
+          clearInterval(secondsHealTimer);
+          secondsHealTimer = null;
+        }
+      } else if (!isPaused && !secondsHealTimer) {
+        await loadHealCursors();
+        secondsHealTimer = setInterval(healSecondsStep, 1000);
+      }
     }
   } catch {
     /* ignore */
@@ -615,6 +627,145 @@ async function cleanOldSeconds() {
     await db.secondCandles.where('t').below(cutoff).delete();
   } catch (err) {
     console.error('Second candle cleanup error:', err);
+  }
+}
+
+async function loadHealCursors() {
+  try {
+    const row = await db.settings.get('secondsHealCursors');
+    if (row && row.value && typeof row.value === 'object') {
+      for (const [k, v] of Object.entries(row.value)) {
+        if (typeof v === 'number') {
+          secondsHealCursors.set(k, v);
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+async function saveHealCursors() {
+  try {
+    const obj: Record<string, number> = {};
+    for (const [k, v] of secondsHealCursors.entries()) {
+      obj[k] = v;
+    }
+    await db.settings.put({ key: 'secondsHealCursors', value: obj });
+  } catch {
+    /* ignore */
+  }
+}
+
+async function healSecondsStep() {
+  if (!secondsEnabled || isPaused || isHealingSeconds) return;
+  isHealingSeconds = true;
+
+  try {
+    const now = Date.now();
+    const targetEndTime = now - 10 * 60 * 1000;
+    const windowStart = now - secondsRetentionHours * 3600000;
+
+    let advancedAny = false;
+
+    for (const sym of trackedSymbols) {
+      if (!secondsEnabled || isPaused) break;
+
+      let cursor = secondsHealCursors.get(sym);
+      if (cursor === undefined) {
+        const first = await db.secondCandles
+          .where('[sym+t]')
+          .between([sym, windowStart], [sym, Dexie.maxKey])
+          .first();
+        cursor = first ? Math.max(windowStart, first.t) : windowStart;
+        secondsHealCursors.set(sym, cursor);
+        advancedAny = true;
+      }
+
+      if (cursor < windowStart) {
+        cursor = windowStart;
+        secondsHealCursors.set(sym, cursor);
+        advancedAny = true;
+      }
+
+      if (cursor >= targetEndTime) {
+        continue;
+      }
+
+      const existing = await db.secondCandles
+        .where('[sym+t]')
+        .between([sym, cursor], [sym, targetEndTime])
+        .limit(1001)
+        .toArray();
+
+      if (existing.length > 0 && existing[0].t === cursor) {
+        let contiguous = cursor;
+        for (const c of existing) {
+          if (c.t === contiguous) {
+            contiguous += 1000;
+          } else {
+            break;
+          }
+        }
+        cursor = contiguous;
+        secondsHealCursors.set(sym, cursor);
+        advancedAny = true;
+        if (cursor >= targetEndTime) {
+          continue;
+        }
+      }
+
+      const nextExistingTime =
+        existing.length > 0 && existing[0].t > cursor ? existing[0].t : targetEndTime;
+
+      const gapSeconds = Math.ceil((nextExistingTime - cursor) / 1000);
+      const limit = Math.min(1000, Math.max(1, gapSeconds));
+
+      try {
+        const klines = await adapter.fetchKlines(sym, '1s', cursor, limit);
+        if (klines && klines.length > 0) {
+          const valid = klines.filter((k) => k.openTime <= targetEndTime);
+          const records: SecondCandleRecord[] = valid.map((k) => ({
+            sym,
+            t: k.openTime,
+            o: k.open,
+            h: k.high,
+            l: k.low,
+            c: k.close,
+            v: k.volume,
+            nt: k.trades,
+            tbv: k.takerBuyBase,
+            tbq: k.takerBuyQuote,
+          }));
+
+          if (records.length > 0) {
+            await db.secondCandles.bulkPut(records);
+          }
+
+          const lastTime = klines[klines.length - 1].openTime;
+          cursor = Math.max(cursor + 1000, lastTime + 1000);
+          secondsHealCursors.set(sym, cursor);
+          advancedAny = true;
+        } else {
+          cursor = Math.min(cursor + 1000 * 1000, nextExistingTime);
+          secondsHealCursors.set(sym, cursor);
+          advancedAny = true;
+        }
+      } catch (err) {
+        console.warn(`[SecondsHealer] Error fetching 1s klines for ${sym}:`, err);
+        break;
+      }
+
+      await new Promise((r) => setTimeout(r, 80));
+    }
+
+    if (advancedAny) {
+      await saveHealCursors();
+    }
+  } catch (err) {
+    console.error('[SecondsHealer] Healing error:', err);
+  } finally {
+    isHealingSeconds = false;
   }
 }
 
@@ -865,6 +1016,13 @@ function startCollector() {
     cleanOldSeconds();
     secondsCleanTimer = setInterval(cleanOldSeconds, 600000);
   }
+  if (!secondsHealTimer) {
+    loadHealCursors().then(() => {
+      if (secondsEnabled && !secondsHealTimer) {
+        secondsHealTimer = setInterval(healSecondsStep, 1000);
+      }
+    });
+  }
   if (!secLabTimer) secLabTimer = setInterval(applySecLabSetting, 30000);
   if (!secLabFlushTimer) secLabFlushTimer = setInterval(flushSecLab, 1000);
   if (!secLabPruneTimer) {
@@ -887,6 +1045,10 @@ function stopCollector() {
   if (secondsCleanTimer) {
     clearInterval(secondsCleanTimer);
     secondsCleanTimer = null;
+  }
+  if (secondsHealTimer) {
+    clearInterval(secondsHealTimer);
+    secondsHealTimer = null;
   }
   if (secLabTimer) {
     clearInterval(secLabTimer);

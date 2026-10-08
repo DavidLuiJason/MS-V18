@@ -129,7 +129,7 @@ export const SecondsDataCard: React.FC = () => {
 
       {/* Notice */}
       <div className="text-[11px] text-slate-400">
-        Changes apply within 30 seconds. Missing seconds (phone asleep or offline) are not repaired.
+        Changes apply within 30 seconds. Missing seconds are auto-healed up to 10 minutes behind live data.
       </div>
 
       {/* Tracked coins list */}

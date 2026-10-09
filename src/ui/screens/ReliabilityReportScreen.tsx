@@ -7,6 +7,8 @@ import { getSetting, setSetting } from '../../data/repositories';
 import { ArenaCard } from '../components/ArenaCard';
 import { SecondsDataCard } from '../components/SecondsDataCard';
 import { SecondsLabCard } from '../components/SecondsLabCard';
+import { SecondsExportCard } from '../components/SecondsExportCard';
+import { EvidenceSummaryCard } from '../components/EvidenceSummaryCard';
 
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d'];
 
@@ -413,6 +415,8 @@ export const ReliabilityReportScreen: React.FC = () => {
       <ArenaCard />
       <SecondsDataCard />
       <SecondsLabCard />
+      <SecondsExportCard />
+      <EvidenceSummaryCard />
     </div>
   );
 };

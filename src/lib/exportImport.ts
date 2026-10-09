@@ -18,6 +18,51 @@ import {
 
 export type ExportScope = 'all' | 'candles' | 'liquidity' | 'settings_profiles' | 'predictions';
 
+export interface ExportProgress {
+  stage: string;
+  detail: string;
+  percent: number;
+}
+
+export interface ExportOptions {
+  onProgress?: (p: ExportProgress) => void;
+  shouldCancel?: () => boolean;
+}
+
+export const EXPORT_CANCELLED = 'Export cancelled';
+
+async function pagedNdjson(
+  table: any,
+  onRows: (n: number) => void,
+  shouldCancel?: () => boolean
+): Promise<{ text: string; count: number }> {
+  const lines: string[] = [];
+  let offset = 0;
+  const PAGE_SIZE = 25000;
+
+  while (true) {
+    const page = await table.offset(offset).limit(PAGE_SIZE).toArray();
+    for (let i = 0; i < page.length; i++) {
+      lines.push(JSON.stringify(page[i]));
+    }
+    offset += page.length;
+    onRows(page.length);
+
+    await new Promise((r) => setTimeout(r, 0));
+
+    if (shouldCancel && shouldCancel()) {
+      throw new Error(EXPORT_CANCELLED);
+    }
+
+    if (page.length < PAGE_SIZE) {
+      break;
+    }
+  }
+
+  const text = lines.join('\n') + (lines.length > 0 ? '\n' : '');
+  return { text, count: lines.length };
+}
+
 export interface ManifestTableEntry {
   file: string;
   count: number;
@@ -54,7 +99,10 @@ export async function calculateSha256(text: string): Promise<string> {
   return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-export async function exportDataZip(scope: ExportScope = 'all'): Promise<{ blob: Blob; filename: string }> {
+export async function exportDataZip(
+  scope: ExportScope = 'all',
+  options: ExportOptions = {}
+): Promise<{ blob: Blob; filename: string }> {
   const zip = new JSZip();
   const tables: Record<string, ManifestTableEntry> = {};
 
@@ -63,29 +111,58 @@ export async function exportDataZip(scope: ExportScope = 'all'): Promise<{ blob:
   const includeSettings = scope === 'all' || scope === 'settings_profiles';
   const includePredictions = scope === 'all' || scope === 'predictions';
 
+  const plannedRows =
+    (includeLiquidity ? (await db.ticks.count()) + (await db.quoteBars.count()) : 0) +
+    (includeCandles ? await db.candles.count() : 0) +
+    (includePredictions ? await db.predictions.count() : 0);
+
+  let rowsRead = 0;
+  const report = (stage: string, detail: string) => {
+    const percent = plannedRows > 0 ? Math.min(60, Math.round((rowsRead / plannedRows) * 60)) : 0;
+    options.onProgress?.({ stage, detail, percent });
+  };
+
   if (includeLiquidity) {
     // ticks
-    const ticks = await db.ticks.toArray();
-    const ticksNdjson = ticks.map((row) => JSON.stringify(row)).join('\n') + (ticks.length > 0 ? '\n' : '');
-    const ticksSha = await calculateSha256(ticksNdjson);
-    zip.file('ticks.ndjson', ticksNdjson);
-    tables['ticks'] = { file: 'ticks.ndjson', count: ticks.length, sha256: ticksSha };
+    const ticksRes = await pagedNdjson(
+      db.ticks,
+      (n) => {
+        rowsRead += n;
+        report('Reading ticks', rowsRead.toLocaleString() + ' of ' + plannedRows.toLocaleString() + ' rows');
+      },
+      options.shouldCancel
+    );
+    const ticksSha = await calculateSha256(ticksRes.text);
+    zip.file('ticks.ndjson', ticksRes.text);
+    tables['ticks'] = { file: 'ticks.ndjson', count: ticksRes.count, sha256: ticksSha };
 
     // quoteBars
-    const quoteBars = await db.quoteBars.toArray();
-    const quoteBarsNdjson = quoteBars.map((row) => JSON.stringify(row)).join('\n') + (quoteBars.length > 0 ? '\n' : '');
-    const quoteBarsSha = await calculateSha256(quoteBarsNdjson);
-    zip.file('quoteBars.ndjson', quoteBarsNdjson);
-    tables['quoteBars'] = { file: 'quoteBars.ndjson', count: quoteBars.length, sha256: quoteBarsSha };
+    const quoteBarsRes = await pagedNdjson(
+      db.quoteBars,
+      (n) => {
+        rowsRead += n;
+        report('Reading quote bars', rowsRead.toLocaleString() + ' of ' + plannedRows.toLocaleString() + ' rows');
+      },
+      options.shouldCancel
+    );
+    const quoteBarsSha = await calculateSha256(quoteBarsRes.text);
+    zip.file('quoteBars.ndjson', quoteBarsRes.text);
+    tables['quoteBars'] = { file: 'quoteBars.ndjson', count: quoteBarsRes.count, sha256: quoteBarsSha };
   }
 
   if (includeCandles) {
     // candles
-    const candles = await db.candles.toArray();
-    const candlesNdjson = candles.map((row) => JSON.stringify(row)).join('\n') + (candles.length > 0 ? '\n' : '');
-    const candlesSha = await calculateSha256(candlesNdjson);
-    zip.file('candles.ndjson', candlesNdjson);
-    tables['candles'] = { file: 'candles.ndjson', count: candles.length, sha256: candlesSha };
+    const candlesRes = await pagedNdjson(
+      db.candles,
+      (n) => {
+        rowsRead += n;
+        report('Reading candles', rowsRead.toLocaleString() + ' of ' + plannedRows.toLocaleString() + ' rows');
+      },
+      options.shouldCancel
+    );
+    const candlesSha = await calculateSha256(candlesRes.text);
+    zip.file('candles.ndjson', candlesRes.text);
+    tables['candles'] = { file: 'candles.ndjson', count: candlesRes.count, sha256: candlesSha };
   }
 
   if (scope === 'all') {
@@ -121,11 +198,17 @@ export async function exportDataZip(scope: ExportScope = 'all'): Promise<{ blob:
   }
 
   if (includePredictions) {
-    const predictions = await db.predictions.toArray();
-    const predictionsNdjson = predictions.map((row) => JSON.stringify(row)).join('\n') + (predictions.length > 0 ? '\n' : '');
-    const predictionsSha = await calculateSha256(predictionsNdjson);
-    zip.file('predictions.ndjson', predictionsNdjson);
-    tables['predictions'] = { file: 'predictions.ndjson', count: predictions.length, sha256: predictionsSha };
+    const predictionsRes = await pagedNdjson(
+      db.predictions,
+      (n) => {
+        rowsRead += n;
+        report('Reading predictions', rowsRead.toLocaleString() + ' of ' + plannedRows.toLocaleString() + ' rows');
+      },
+      options.shouldCancel
+    );
+    const predictionsSha = await calculateSha256(predictionsRes.text);
+    zip.file('predictions.ndjson', predictionsRes.text);
+    tables['predictions'] = { file: 'predictions.ndjson', count: predictionsRes.count, sha256: predictionsSha };
 
     const arenaSignals = await db.arenaSignals.toArray();
     const arenaSignalsNdjson = arenaSignals.map((row) => JSON.stringify(row)).join('\n') + (arenaSignals.length > 0 ? '\n' : '');
@@ -172,7 +255,19 @@ export async function exportDataZip(scope: ExportScope = 'all'): Promise<{ blob:
 
   zip.file('manifest.json', JSON.stringify(manifest, null, 2));
 
-  const blob = await zip.generateAsync({ type: 'blob' });
+  options.onProgress?.({ stage: 'Compressing', detail: 'cannot be cancelled', percent: 60 });
+  const blob = await zip.generateAsync(
+    { type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 1 } },
+    (meta) => {
+      options.onProgress?.({
+        stage: 'Compressing',
+        detail: 'cannot be cancelled',
+        percent: 60 + Math.round(meta.percent * 0.3),
+      });
+    }
+  );
+
+  if (options.shouldCancel && options.shouldCancel()) throw new Error(EXPORT_CANCELLED);
 
   const now = new Date();
   const yyyy = now.getUTCFullYear();

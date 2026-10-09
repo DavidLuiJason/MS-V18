@@ -2,8 +2,16 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useAppStore } from '../../state/store';
 import { getDatabaseStats, getGapsList } from '../../data/repositories';
 import { formatBytes } from '../../lib/formatters';
-import { exportDataZip, exportCandlesCsv, importDataZip, type ExportScope, type ImportSummary } from '../../lib/exportImport';
-import { saveAndShareFile, exportCandlesCsvInChunks } from '../../lib/saveAndShare';
+import {
+  exportDataZip,
+  exportCandlesCsv,
+  importDataZip,
+  type ExportScope,
+  type ImportSummary,
+  type ExportProgress,
+  EXPORT_CANCELLED,
+} from '../../lib/exportImport';
+import { saveAndShareFile, exportCandlesCsvInChunks, saveBlobChunked } from '../../lib/saveAndShare';
 import { exportPatternsZip, PATTERN_REPORTS, type PatternReport } from '../../lib/patternExport';
 import { workerClient } from '../../collector/workerClient';
 import { db, type CollectorLogRecord } from '../../data/db';
@@ -68,6 +76,10 @@ export const DataStorageScreen: React.FC = () => {
   const [patternReports, setPatternReports] = useState<PatternReport[]>(['rules', 'occurrences']);
   const [patternStatus, setPatternStatus] = useState('');
   const [isExporting, setIsExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
+  const [exportElapsed, setExportElapsed] = useState(0);
+  const exportCancelRef = useRef(false);
+  const exportStartRef = useRef(0);
   const [importSummary, setImportSummary] = useState<ImportSummary | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
   const [isImporting, setIsImporting] = useState(false);
@@ -145,6 +157,12 @@ export const DataStorageScreen: React.FC = () => {
     loadData();
   }, [gapsVersion]);
 
+  useEffect(() => {
+    if (!isExporting || exportScope === 'patterns') return;
+    const id = setInterval(() => setExportElapsed(Math.floor((Date.now() - exportStartRef.current) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [isExporting, exportScope]);
+
   const handleRepairAll = async () => {
     setIsRepairing(true);
     workerClient.repairAllGaps();
@@ -217,14 +235,34 @@ export const DataStorageScreen: React.FC = () => {
       return;
     }
     setIsExporting(true);
+    exportCancelRef.current = false;
+    exportStartRef.current = Date.now();
+    setExportElapsed(0);
+    setExportProgress({ stage: 'Starting', detail: '', percent: 0 });
     try {
-      const { blob, filename } = await exportDataZip(exportScope);
-      await saveAndShareFile(blob, filename);
+      const { blob, filename } = await exportDataZip(exportScope, {
+        onProgress: (p) => setExportProgress(p),
+        shouldCancel: () => exportCancelRef.current,
+      });
+      await saveBlobChunked(
+        blob,
+        filename,
+        (f) =>
+          setExportProgress({
+            stage: 'Saving file',
+            detail: Math.round(f * 100) + '% written',
+            percent: 90 + Math.round(f * 10),
+          }),
+        () => exportCancelRef.current
+      );
       setShowExportModal(false);
     } catch (err: any) {
-      alert(`Export failed: ${err.message}`);
+      if (String(err && err.message) !== EXPORT_CANCELLED) {
+        alert('Export failed: ' + (err && err.message));
+      }
     } finally {
       setIsExporting(false);
+      setExportProgress(null);
     }
   };
 
@@ -834,6 +872,42 @@ export const DataStorageScreen: React.FC = () => {
                   Each coin and timeframe is studied one by one, so more choices take longer. Each needs at least 500 saved candles.
                 </div>
                 {patternStatus !== '' && <div className="text-[11px] text-slate-300">{patternStatus}</div>}
+              </div>
+            )}
+
+            {exportProgress !== null && (
+              <div className="mb-4 p-4 rounded-2xl bg-slate-800/80 border border-slate-700/80 space-y-2 text-xs">
+                <div className="flex items-center justify-between text-slate-200">
+                  <span className="font-semibold truncate pr-2">
+                    {exportProgress.stage + (exportProgress.detail ? ' - ' + exportProgress.detail : '')}
+                  </span>
+                  <span className="font-mono font-bold text-cyan-400">{exportProgress.percent}%</span>
+                </div>
+                <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                  <div
+                    className="h-full bg-cyan-400 transition-all duration-300"
+                    style={{ width: `${exportProgress.percent}%` }}
+                  />
+                </div>
+                <div className="flex items-center justify-between text-slate-400 pt-0.5">
+                  <span className="font-mono">
+                    Time elapsed:{' '}
+                    {String(Math.floor(exportElapsed / 60)).padStart(2, '0')}:
+                    {String(exportElapsed % 60).padStart(2, '0')}
+                  </span>
+                  <button
+                    onClick={() => {
+                      exportCancelRef.current = true;
+                    }}
+                    disabled={exportCancelRef.current}
+                    className="px-2.5 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 font-semibold transition disabled:opacity-50"
+                  >
+                    {exportCancelRef.current ? 'Cancelling...' : 'Cancel'}
+                  </button>
+                </div>
+                <div className="text-[10px] text-slate-500 leading-tight">
+                  Still working. Keep this screen open. If the timer stops counting, the phone is busy; wait.
+                </div>
               </div>
             )}
 

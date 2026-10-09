@@ -80,6 +80,39 @@ export async function saveAndShareFile(blob: Blob, filename: string): Promise<vo
   URL.revokeObjectURL(url);
 }
 
+export async function saveBlobChunked(
+  blob: Blob,
+  filename: string,
+  onProgress?: (fraction: number) => void,
+  shouldCancel?: () => boolean
+): Promise<void> {
+  if (!Capacitor.isNativePlatform()) {
+    await saveAndShareFile(blob, filename);
+    return;
+  }
+  const CHUNK = 3 * 1024 * 1024;
+  let offset = 0;
+  let uri = '';
+  while (offset < blob.size) {
+    if (shouldCancel && shouldCancel()) {
+      try {
+        await Filesystem.deleteFile({ path: filename, directory: Directory.Cache });
+      } catch (e) {}
+      throw new Error('Export cancelled');
+    }
+    const data = await blobToBase64(blob.slice(offset, offset + CHUNK));
+    if (offset === 0) {
+      const written = await Filesystem.writeFile({ path: filename, data, directory: Directory.Cache });
+      uri = written.uri;
+    } else {
+      await Filesystem.appendFile({ path: filename, data, directory: Directory.Cache });
+    }
+    offset += CHUNK;
+    if (onProgress) onProgress(Math.min(1, offset / blob.size));
+  }
+  await deliverNativeFile(uri, filename, guessMimeType(filename, blob.type));
+}
+
 export async function exportCandlesCsvInChunks(onProgress?: (rows: number) => void): Promise<number> {
   const now = new Date();
   const yyyy = now.getUTCFullYear();

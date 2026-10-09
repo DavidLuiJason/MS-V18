@@ -12,6 +12,8 @@ import {
   type ArenaSignalRecord,
   type ArenaOutcomeRecord,
   type ArenaTrialRecord,
+  type SecBetRecord,
+  type SecTrialRecord,
 } from '../data/db';
 
 export type ExportScope = 'all' | 'candles' | 'liquidity' | 'settings_profiles' | 'predictions';
@@ -142,6 +144,21 @@ export async function exportDataZip(scope: ExportScope = 'all'): Promise<{ blob:
     const arenaTrialsSha = await calculateSha256(arenaTrialsNdjson);
     zip.file('arenaTrials.ndjson', arenaTrialsNdjson);
     tables['arenaTrials'] = { file: 'arenaTrials.ndjson', count: arenaTrials.length, sha256: arenaTrialsSha };
+
+    const secBetLines: string[] = [];
+    await db.secBets.orderBy('decisionT').each((row) => {
+      secBetLines.push(JSON.stringify(row));
+    });
+    const secBetsNdjson = secBetLines.join('\n') + (secBetLines.length > 0 ? '\n' : '');
+    const secBetsSha = await calculateSha256(secBetsNdjson);
+    zip.file('secBets.ndjson', secBetsNdjson);
+    tables['secBets'] = { file: 'secBets.ndjson', count: secBetLines.length, sha256: secBetsSha };
+
+    const secTrials = await db.secTrials.toArray();
+    const secTrialsNdjson = secTrials.map((row) => JSON.stringify(row)).join('\n') + (secTrials.length > 0 ? '\n' : '');
+    const secTrialsSha = await calculateSha256(secTrialsNdjson);
+    zip.file('secTrials.ndjson', secTrialsNdjson);
+    tables['secTrials'] = { file: 'secTrials.ndjson', count: secTrials.length, sha256: secTrialsSha };
   }
 
   const manifest: Manifest = {
@@ -209,6 +226,8 @@ export async function importDataZip(file: File): Promise<ImportSummary> {
     'arenaSignals',
     'arenaOutcomes',
     'arenaTrials',
+    'secBets',
+    'secTrials',
   ]);
 
   for (const [tableName, meta] of Object.entries(manifest.tables)) {
@@ -372,6 +391,20 @@ export async function importDataZip(file: File): Promise<ImportSummary> {
         }
         addedCount += toAdd.length;
         skippedCount += (batch.length - toAdd.length);
+      } else if (tableName === 'secBets') {
+        const batch = parsedRecords as SecBetRecord[];
+        const existing = await db.secBets.bulkGet(batch.map((b) => b.id));
+        const toAdd = batch.filter((_, j) => !existing[j]);
+        if (toAdd.length > 0) await db.secBets.bulkAdd(toAdd);
+        addedCount += toAdd.length;
+        skippedCount += batch.length - toAdd.length;
+      } else if (tableName === 'secTrials') {
+        const batch = parsedRecords as SecTrialRecord[];
+        const existing = await db.secTrials.bulkGet(batch.map((b) => b.id));
+        const toAdd = batch.filter((_, j) => !existing[j]);
+        if (toAdd.length > 0) await db.secTrials.bulkAdd(toAdd);
+        addedCount += toAdd.length;
+        skippedCount += batch.length - toAdd.length;
       }
     }
 
